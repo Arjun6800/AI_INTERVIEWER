@@ -23,6 +23,7 @@ export default function InterviewPage() {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [currentQuestion, setCurrentQuestion] = useState("");
   const [isComplete, setIsComplete] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(null);
   const [showNameModal, setShowNameModal] = useState(false);
   const [candidateName, setCandidateName] = useState("");
   const [rounds, setRounds] = useState([]);
@@ -259,6 +260,35 @@ export default function InterviewPage() {
     }
   }, [cameraActive, sessionInfo, joining]);
 
+  
+  // Timer countdown
+  useEffect(() => {
+    if (!sessionId || isComplete || timeLeft === null) return;
+    
+    if (timeLeft <= 0) {
+      // Auto-submit or end interview
+      if (!isComplete) {
+         toast.error("Time is up! Submitting your final state...", { duration: 5000, icon: "⏱️" });
+         // We can gracefully close or simply flag it. We'll set isComplete to true to stop everything for now
+         setIsComplete(true);
+         // You might want to call the finish API here
+         api.post(`/interview/complete/${sessionId}`).catch(() => {});
+         setTimeout(() => navigate(`/summary/${sessionId}`), 2500);
+      }
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev === 5 * 60) {
+           toast.error("Only 5 minutes left!", { icon: "⏰", duration: 5000 });
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [sessionId, isComplete, timeLeft, navigate]);
+
   // Auto-scroll to bottom
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -303,6 +333,7 @@ export default function InterviewPage() {
       setCurrentQuestion(res.data.question);
       setRounds(res.data.rounds);
       setQuestionsPerRound(res.data.questionsPerRound);
+      if (sessionInfo?.timeLimit) { setTimeLeft(sessionInfo.timeLimit * 60); }
       setMessages([{ type: "ai", text: res.data.question, round: res.data.currentRound }]);
       speakQuestion(res.data.question);
     } catch (err) {
@@ -580,6 +611,20 @@ export default function InterviewPage() {
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
+          {timeLeft !== null && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 8,
+              padding: "6px 12px", borderRadius: 8,
+              background: timeLeft <= 300 ? "rgba(239, 68, 68, 0.1)" : "rgba(108, 99, 255, 0.1)",
+              border: `1px solid ${timeLeft <= 300 ? "rgba(239, 68, 68, 0.2)" : "rgba(108, 99, 255, 0.2)"}`
+            }}>
+              <Clock size={14} color={timeLeft <= 300 ? "var(--danger)" : "var(--accent-primary)"} />
+              <span style={{ fontSize: 13, fontWeight: 700, color: timeLeft <= 300 ? "var(--danger)" : "var(--accent-primary)", fontVariantNumeric: "tabular-nums" }}>
+                {Math.floor(timeLeft / 60).toString().padStart(2, '0')}:{(timeLeft % 60).toString().padStart(2, '0')}
+              </span>
+            </div>
+          )}
+
           {rounds.length > 0 && <RoundProgress rounds={rounds} currentRound={currentRound} />}
           <div style={{ 
             display: "flex", alignItems: "center", gap: 8, 
