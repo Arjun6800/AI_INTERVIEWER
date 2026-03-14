@@ -77,7 +77,7 @@ export const getSessionByToken = async (req, res) => {
 };
 export const logProctoringEvent = async (req, res) => {
   try {
-    const { sessionId, eventType, details } = req.body;
+    const { sessionId, eventType, details, scorePenalty, frameData } = req.body;
     const session = await Session.findById(sessionId);
     if (!session) return res.status(404).json({ message: "Session not found" });
 
@@ -85,16 +85,21 @@ export const logProctoringEvent = async (req, res) => {
       session.proctoring = { tabSwitches: 0, copyPasteAttempts: 0, trustScore: 100, isSuspicious: false, logs: [] };
     }
 
-    let penalty = 0;
-    if (eventType === "tab-switch") {
-      session.proctoring.tabSwitches += 1;
-      penalty = 5;
-    } else if (eventType === "copy-paste") {
-      session.proctoring.copyPasteAttempts += 1;
-      penalty = 10;
-    } else if (eventType === "face-event") {
-      penalty = details.includes("Multiple") ? 20 : 10;
+    let penalty = scorePenalty || 0;
+    if (!scorePenalty) {
+      if (eventType === "tab-switch") {
+        session.proctoring.tabSwitches += 1;
+        penalty = 5;
+      } else if (eventType === "copy-paste") {
+        session.proctoring.copyPasteAttempts += 1;
+        penalty = 10;
+      } else if (eventType === "face-event") {
+        penalty = details.includes("Multiple") ? 20 : 10;
+      }
     }
+
+    if (eventType === "Tab Switch" || eventType === "tab-switch") session.proctoring.tabSwitches += 1;
+    if (eventType === "Copy/Paste" || eventType === "copy-paste") session.proctoring.copyPasteAttempts += 1;
 
     session.proctoring.trustScore = Math.max(0, session.proctoring.trustScore - penalty);
     if (session.proctoring.trustScore < 60) {
@@ -104,6 +109,7 @@ export const logProctoringEvent = async (req, res) => {
     session.proctoring.logs.push({
       event: `${eventType}: ${details}`,
       timestamp: new Date(),
+      frameImage: frameData || null
     });
 
     await session.save();

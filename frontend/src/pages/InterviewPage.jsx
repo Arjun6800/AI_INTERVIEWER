@@ -6,6 +6,7 @@ import RoundProgress from "../components/RoundProgress";
 import { Send, Bot, User, Loader2, Clock, Zap, ShieldCheck, ShieldAlert, Mic, MicOff, Volume2 } from "lucide-react";
 import toast from "react-hot-toast";
 import { motion, AnimatePresence } from "framer-motion";
+import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
 
 export default function InterviewPage() {
   const { token } = useParams();
@@ -30,12 +31,42 @@ export default function InterviewPage() {
   const [trustScore, setTrustScore] = useState(100);
   const [isListening, setIsListening] = useState(false);
 
+  // Monitoring States
+  const [cameraActive, setCameraActive] = useState(false);
+  const [warnings, setWarnings] = useState([]);
+  
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const faceDetectorRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const monitoringIntervalRef = useRef(null);
+
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
   const recognitionRef = useRef(null);
 
   // Initialize Speech Recognition
   useEffect(() => {
+    // Initialize FaceDetector
+    const initializeFaceDetector = async () => {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm"
+        );
+        faceDetectorRef.current = await FaceDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite`,
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO"
+        });
+      } catch (err) {
+        console.error("Failed to load FaceDetector", err);
+      }
+    };
+    initializeFaceDetector();
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition) {
       recognitionRef.current = new SpeechRecognition();
@@ -74,6 +105,9 @@ export default function InterviewPage() {
     return () => {
       if (recognitionRef.current) recognitionRef.current.stop();
       if (window.speechSynthesis) window.speechSynthesis.cancel();
+      if (monitoringIntervalRef.current) clearInterval(monitoringIntervalRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+      if (audioContextRef.current) audioContextRef.current.close();
     };
   }, []);
 
@@ -101,6 +135,130 @@ export default function InterviewPage() {
     window.speechSynthesis.speak(speech);
   };
 
+  const logSuspiciousEvent = async (type, details, scorePenalty) => {
+    setWarnings(prev => [...prev.slice(-4), `${new Date().toLocaleTimeString()} - ${type}: ${details}`]);
+    setTrustScore(prev => Math.max(0, prev - scorePenalty));
+    let frameData = null;
+    if (videoRef.current && canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+      frameData = canvasRef.current.toDataURL('image/jpeg', 0.5);
+    }
+    
+    try {
+      await api.post("/sessions/log-event", {
+        sessionId,
+        eventType: type,
+        details,
+        scorePenalty,
+        frameData
+      });
+    } catch (err) { console.error("Logging failed", err); }
+  };
+
+  const startMonitoring = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+      setCameraActive(true);
+
+      // Basic Audio Monitoring (noise level)
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const analyser = audioContextRef.current.createAnalyser();
+      const microphone = audioContextRef.current.createMediaStreamSource(stream);
+      microphone.connect(analyser);
+      analyser.fftSize = 256;
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      let lastLookAwayTime = 0;
+      let checkCount = 0;
+
+      monitoringIntervalRef.current = setInterval(async () => {
+        if (!videoRef.current || !faceDetectorRef.current || isComplete) return;
+
+        // 1. Audio Activity Check
+        analyser.getByteFrequencyData(dataArray);
+        let audioSum = dataArray.reduce((acc, val) => acc + val, 0);
+        let avgAudio = audioSum / bufferLength;
+        // Simple background noise/talking check (threshold might vary in real-world)
+        // We won't strictly penalize audio continuously without advanced multi-voice model, but we check if it's extremely loud
+        
+        // 2. Face Detection
+        try {
+          // ensure video is playing
+          if(videoRef.current.readyState >= 2 && videoRef.current.videoWidth > 0) {
+             const startTimeMs = performance.now();
+             const detections = faceDetectorRef.current.detectForVideo(videoRef.current, startTimeMs);
+             
+             // Check if detections object and detections.detections exist
+             if (detections && detections.detections) {
+               if (detections.detections.length === 0) {
+                 checkCount++;
+                 if (checkCount > 2) { 
+                   logSuspiciousEvent("Face Not Detected", "Candidate not visible in frame", 3);
+                   checkCount = 0;
+                 }
+               } else if (detections.detections.length > 1) {
+                 logSuspiciousEvent("Multiple Faces", "More than one person detected in frame", 5);
+               } else {
+                 checkCount = 0;
+                 // Basic "looking away" heuristic (bounding box position in frame)
+                 const face = detections.detections[0].boundingBox;
+                 const videoW = videoRef.current.videoWidth;
+                 // If face is fully off-center significantly
+                 if (face && (face.originX < -20 || (face.originX + face.width) > videoW + 20)) {
+                   if (!lastLookAwayTime) lastLookAwayTime = Date.now();
+                   else if (Date.now() - lastLookAwayTime > 3000) {
+                     logSuspiciousEvent("Looking Away", "Candidate appears to be looking off-screen", 2);
+                     lastLookAwayTime = 0;
+                   }
+                 } else {
+                   lastLookAwayTime = 0;
+                 }
+               }
+             }
+          }
+        } catch(e) { /* ignore tracking errors */ }
+      }, 2000);
+
+      return true;
+    } catch (err) {
+      toast.error("Camera & Microphone access is required for this interview.", { duration: 5000 });
+      return false;
+    }
+  };
+
+  // Re-attach stream to video if component re-renders
+  useEffect(() => {
+    // Need to constantly check since refs don't trigger re-renders
+    const interval = setInterval(() => {
+      if (cameraActive && streamRef.current && videoRef.current && videoRef.current.srcObject !== streamRef.current) {
+        videoRef.current.srcObject = streamRef.current;
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [cameraActive]);
+  
+  useEffect(() => {
+    // Need to constantly check since refs don't trigger re-renders
+    const interval = setInterval(() => {
+      if (cameraActive && streamRef.current && videoRef.current && videoRef.current.srcObject !== streamRef.current) {
+        videoRef.current.srcObject = streamRef.current;
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [cameraActive]);
+  
+  useEffect(() => {
+    if (cameraActive && streamRef.current && videoRef.current && videoRef.current.srcObject !== streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+    }
+  }, [cameraActive, sessionInfo, joining]);
+
   // Auto-scroll to bottom
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -127,6 +285,14 @@ export default function InterviewPage() {
   }, [token]);
 
   const joinInterview = async () => {
+    // Attempt camera start first
+    if (!cameraActive) {
+      const allowed = await startMonitoring();
+      if (!allowed) {
+        return;
+      }
+    }
+
     setJoining(true);
     setShowConsent(false);
     try {
@@ -177,34 +343,28 @@ export default function InterviewPage() {
       if (document.hidden) {
         const newCount = tabSwitches + 1;
         setTabSwitches(newCount);
-        setTrustScore(prev => Math.max(0, prev - 5));
-        
-        // Log to backend
-        try {
-          await api.post("/sessions/log-event", {
-            sessionId,
-            eventType: "tab-switch",
-            details: `Candidate switched tabs (#${newCount}). Penalty: -5`,
-          });
-        } catch (err) { console.error("Logging failed", err); }
-
-        // Local warnings
+        logSuspiciousEvent("Tab Switch", `Candidate switched tabs (#${newCount})`, 5);
         toast.error(`Activity Monitored: Tab switch detected (-5 points).`, { icon: "⚠️" });
       }
     };
 
     const handleCopyPaste = async (e) => {
       e.preventDefault();
-      setTrustScore(prev => Math.max(0, prev - 10));
+      logSuspiciousEvent("Copy/Paste", `Attempted to ${e.type}`, 10);
       toast.error(`${e.type.charAt(0).toUpperCase() + e.type.slice(1)} is disabled (-10 points).`, { icon: "🔒" });
-      
-      try {
-        await api.post("/sessions/log-event", {
-          sessionId,
-          eventType: "copy-paste",
-          details: `Attempted to ${e.type}. Penalty: -10`,
-        });
-      } catch (err) { console.error("Logging failed", err); }
+    };
+
+    const handleKeyboard = (e) => {
+      // Prevent dev tools and typical shortcuts
+      if (
+        (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i' || e.key === 'J' || e.key === 'j' || e.key === 'C' || e.key === 'c')) ||
+        (e.ctrlKey && (e.key === 'u' || e.key === 'U')) ||
+        e.key === 'F12'
+      ) {
+        e.preventDefault();
+        logSuspiciousEvent("Keyboard Shortcut", "Attempted to open DevTools or forbidden shortcut", 5);
+        toast.error("Developer tools are disabled.", { icon: "🔒" });
+      }
     };
 
     const handleContextMenu = (e) => {
@@ -215,12 +375,16 @@ export default function InterviewPage() {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     document.addEventListener("copy", handleCopyPaste);
     document.addEventListener("paste", handleCopyPaste);
+    document.addEventListener("cut", handleCopyPaste);
+    document.addEventListener("keydown", handleKeyboard);
     document.addEventListener("contextmenu", handleContextMenu);
 
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.removeEventListener("copy", handleCopyPaste);
       document.removeEventListener("paste", handleCopyPaste);
+      document.removeEventListener("cut", handleCopyPaste);
+      document.removeEventListener("keydown", handleKeyboard);
       document.removeEventListener("contextmenu", handleContextMenu);
     };
   }, [sessionId, isComplete, tabSwitches]);
@@ -346,7 +510,11 @@ export default function InterviewPage() {
             </li>
             <li style={{ display: "flex", gap: 10 }}>
               <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent-primary)", marginTop: 6 }} />
-              <strong>Anti-Cheating:</strong> Copy/Paste and right-click are disabled.
+              <strong>Camera & Audio:</strong> Continuous monitoring for identity and noise.
+            </li>
+            <li style={{ display: "flex", gap: 10 }}>
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent-primary)", marginTop: 6 }} />
+              <strong>Anti-Cheating:</strong> Copy/Paste, DevTools, and right-click are disabled.
             </li>
             <li style={{ display: "flex", gap: 10 }}>
               <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent-primary)", marginTop: 6 }} />
@@ -424,12 +592,20 @@ export default function InterviewPage() {
               {trustScore}% Trust
             </span>
           </div>
+          {cameraActive && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--danger)", animation: "pulse 1.5s infinite" }} />
+              <span style={{ fontSize: 12, color: "var(--danger)", fontWeight: 'bold' }}>MONITORING ACTIVE</span>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Chat Area */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "24px", display: "flex", flexDirection: "column", gap: 16 }}>
-        <AnimatePresence>
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        
+        {/* Left Side: Chat Area */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "24px", display: "flex", flexDirection: "column", gap: 16 }}>
+          <AnimatePresence>
           {messages.map((msg, i) => (
             <motion.div key={i}
               initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}
@@ -509,25 +685,65 @@ export default function InterviewPage() {
           ))}
         </AnimatePresence>
 
-        {loading && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
-            style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{
-              width: 36, height: 36, borderRadius: 10,
-              background: "var(--accent-gradient)", display: "flex", alignItems: "center", justifyContent: "center",
-            }}>
-              <Bot size={18} color="#fff" />
-            </div>
-            <div className="glass-card" style={{ padding: "14px 18px", borderTopLeftRadius: 4 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-secondary)" }}>
-                <Loader2 size={16} className="animate-spin" style={{ animation: "spin 1s linear infinite" }} />
-                <span style={{ fontSize: 14 }}>AI is evaluating your answer...</span>
+          {loading && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+              style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 10,
+                background: "var(--accent-gradient)", display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                <Bot size={18} color="#fff" />
               </div>
-            </div>
-          </motion.div>
-        )}
+              <div className="glass-card" style={{ padding: "14px 18px", borderTopLeftRadius: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-secondary)" }}>
+                  <Loader2 size={16} className="animate-spin" style={{ animation: "spin 1s linear infinite" }} />
+                  <span style={{ fontSize: 14 }}>AI is evaluating your answer...</span>
+                </div>
+              </div>
+            </motion.div>
+          )}
 
-        <div ref={chatEndRef} />
+          <div ref={chatEndRef} />
+        </div>
+
+        {/* Right Side: Monitoring Panel */}
+        <div style={{ width: 280, borderLeft: "1px solid var(--border-color)", background: "rgba(10, 10, 26, 0.4)", display: "flex", flexDirection: "column", padding: "16px" }}>
+          <div style={{ marginBottom: 16 }}>
+            <h3 style={{ fontSize: 14, fontWeight: "bold", color: "var(--text-secondary)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+              <ShieldCheck size={16} /> Live Proctoring
+            </h3>
+            <div style={{ position: "relative", width: "100%", borderRadius: 12, overflow: "hidden", border: "1px solid var(--border-color)", background: "#000", aspectRatio: "4/3" }}>
+              <video 
+                ref={videoRef} 
+                autoPlay 
+                muted 
+                playsInline 
+                style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} 
+              />
+              {/* Hidden canvas for capturing frames */}
+              <canvas ref={canvasRef} style={{ display: "none" }} width={640} height={480} />
+            </div>
+          </div>
+
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            <h3 style={{ fontSize: 14, fontWeight: "bold", color: "var(--text-secondary)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+              <ShieldAlert size={16} /> Warnings Log
+            </h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {warnings.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic", textAlign: "center", padding: "20px 0" }}>
+                  No suspicious activity detected.
+                </div>
+              ) : (
+                warnings.map((w, i) => (
+                  <div key={i} style={{ fontSize: 12, padding: "8px 10px", background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.2)", borderRadius: 6, color: "var(--danger)" }}>
+                    {w}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Input Area */}
