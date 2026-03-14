@@ -29,6 +29,7 @@ const sessionSchema = new mongoose.Schema(
         {
           event: String,
           timestamp: { type: Date, default: Date.now },
+          frameImage: { type: String, default: null }
         },
       ],
     },
