@@ -7,6 +7,7 @@ import http from "http";
 import connectDB from "./config/db.js";
 import { initSocket } from "./socket/socket.js";
 import authRoutes from "./routes/auth.routes.js";
+import candidateRoutes from "./routes/candidate.routes.js";
 import sessionRoutes from "./routes/session.routes.js";
 import interviewRoutes from "./routes/interview.routes.js";
 
@@ -24,8 +25,27 @@ app.use(express.json({ limit: "10mb" }));
 const io = initSocket(server);
 app.set("io", io);
 
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Serve frontend in production
+if (process.env.NODE_ENV === "production" || process.env.RENDER) {
+  app.use(express.static(path.join(__dirname, "../frontend/dist")));
+  
+  app.get("*", (req, res) => {
+    // Only handle non-API routes
+    if (!req.path.startsWith("/api/")) {
+      res.sendFile(path.resolve(__dirname, "../frontend/dist/index.html"));
+    }
+  });
+}
+
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/candidate", candidateRoutes);
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/interview", interviewRoutes);
 
