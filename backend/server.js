@@ -50,7 +50,8 @@ if (process.env.NODE_ENV === "production" || process.env.RENDER) {
   app.use(express.static(distPath));
 
   // SPA fallback — any non-API route serves index.html
-  app.get("*", (req, res) => {
+  // Express v5 requires named wildcards (path-to-regexp v8)
+  app.get("/{*splat}", (req, res) => {
     res.sendFile(path.resolve(distPath, "index.html"));
   });
 }
